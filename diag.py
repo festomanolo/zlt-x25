@@ -53,42 +53,164 @@ def post_json(url, payload, session_id=""):
         print(f"    EXCEPTION: {exc}")
         return 0, {}, str(exc)
 
-# ── Step 1: login ─────────────────────────────────────────────────────────────
+# ── Step 0: load the index page to get a guest sessionId ─────────────────────
 
 print("=" * 60)
-print("STEP 1 — LOGIN")
+print("STEP 0 — FETCH GUEST SESSION FROM INDEX PAGE")
 print("=" * 60)
 
 url = f"{PROTO}://{ROUTER_IP}/cgi-bin/http.cgi"
+index_url = f"{PROTO}://{ROUTER_IP}/index.html"
 
-status, hdrs, body = post_json(url, {
+guest_sid = ""
+print(f"\n>>> GET {index_url}")
+try:
+    req0 = urllib.request.Request(
+        index_url,
+        headers={"User-Agent": "Mozilla/5.0",
+                 "Accept": "text/html,application/xhtml+xml,*/*"},
+    )
+    with urllib.request.urlopen(req0, timeout=8) as r0:
+        body0 = r0.read().decode("utf-8", errors="ignore")
+        raw_hdrs0 = dict(r0.headers)
+        print(f"    status  : {r0.status}")
+        print(f"    headers : {raw_hdrs0}")
+
+        # Check Set-Cookie for guest session
+        for hdr in ("Set-Cookie", "set-cookie"):
+            v = raw_hdrs0.get(hdr, "")
+            m = re.search(r"sessionId=([A-Za-z0-9_\-]{4,})", v)
+            if m:
+                guest_sid = m.group(1)
+                break
+
+        # Also scan page body for sessionId JS variable
+        if not guest_sid:
+            m = re.search(r'["\']?sessionId["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-]{8,})["\']',
+                          body0)
+            if m:
+                guest_sid = m.group(1)
+
+        print(f"    guest_sid from index: {guest_sid!r}")
+        print(f"    body snippet: {body0[:300]}")
+
+except Exception as exc:
+    print(f"    EXCEPTION: {exc}")
+
+# Also try a GET to http.cgi with no payload — some firmware issues a session
+print(f"\n>>> GET {url} (bare, no payload)")
+try:
+    req_bare = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0",
+                 "Referer": index_url},
+    )
+    with urllib.request.urlopen(req_bare, timeout=8) as rb:
+        body_bare = rb.read().decode("utf-8", errors="ignore")
+        raw_hdrs_bare = dict(rb.headers)
+        print(f"    status  : {rb.status}")
+        print(f"    headers : {raw_hdrs_bare}")
+        print(f"    body    : {body_bare[:300]}")
+        for hdr in ("Set-Cookie", "set-cookie"):
+            v = raw_hdrs_bare.get(hdr, "")
+            m = re.search(r"sessionId=([A-Za-z0-9_\-]{4,})", v)
+            if m:
+                guest_sid = m.group(1)
+                print(f"    guest_sid from bare GET: {guest_sid!r}")
+                break
+except Exception as exc:
+    print(f"    EXCEPTION: {exc}")
+
+# Try cmd:0 GET — firmware often issues a session on first probe
+print(f"\n>>> POST {url} cmd:0 GET (session probe)")
+s_probe, h_probe, b_probe = post_json(url, {
+    "cmd": 0, "method": "GET", "language": "EN",
+})
+print(f"    probe body: {b_probe[:300]}")
+if not guest_sid:
+    for hdr in ("Set-Cookie", "set-cookie"):
+        v = h_probe.get(hdr, "")
+        m = re.search(r"sessionId=([A-Za-z0-9_\-]{4,})", v)
+        if m:
+            guest_sid = m.group(1)
+            print(f"    guest_sid from probe: {guest_sid!r}")
+            break
+    if not guest_sid:
+        try:
+            jp = json.loads(b_probe)
+            for k in ("sessionId", "sid", "token"):
+                if isinstance(jp.get(k), str) and len(jp[k]) >= 4:
+                    guest_sid = jp[k]
+                    print(f"    guest_sid from probe JSON[{k!r}]: {guest_sid!r}")
+                    break
+        except Exception:
+            pass
+
+print(f"\n>>> Using guest_sid: {guest_sid!r}")
+
+# ── Step 1: login ─────────────────────────────────────────────────────────────
+
+print("\n" + "=" * 60)
+print("STEP 1 — LOGIN (with guest sessionId in payload)")
+print("=" * 60)
+
+# Build login payload — include guest_sid if we have one
+login_payload = {
     "cmd": 1, "method": "POST", "subcmd": 1,
     "language": "EN", "username": USERNAME, "password": PASSWORD,
-})
+}
+if guest_sid:
+    login_payload["sessionId"] = guest_sid
 
-# Extract sessionId from anywhere
+status, hdrs, body = post_json(url, login_payload, session_id=guest_sid)
+
+# Extract sessionId — check response body JSON first (X25 puts it there)
 sid = ""
-for hdr in ("Set-Cookie", "set-cookie"):
-    v = hdrs.get(hdr, "")
-    m = re.search(r"sessionId=([A-Za-z0-9_\-]{4,})", v)
-    if m:
-        sid = m.group(1)
-        break
-if not sid:
-    try:
-        j = json.loads(body)
-        for k in ("sessionId", "session_id", "sid", "token"):
-            if isinstance(j.get(k), str) and len(j[k]) >= 4:
-                sid = j[k]
-                break
-    except Exception:
-        pass
-if not sid:
-    m = re.search(r'sessionId["\s:=]+([A-Za-z0-9_\-]{4,})', body)
-    if m:
-        sid = m.group(1)
+try:
+    j = json.loads(body)
+    print(f"\n>>> Login JSON keys: {list(j.keys())}")
+    print(f">>> Login JSON full: {json.dumps(j, indent=2)[:600]}")
+    # X25 returns sessionId directly in the body after successful login
+    for k in ("sessionId", "session_id", "sid", "token", "data"):
+        v = j.get(k)
+        if isinstance(v, str) and len(v) >= 4:
+            sid = v
+            print(f">>> sessionId from JSON[{k!r}]: {sid!r}")
+            break
+        # sometimes nested under "data" dict
+        if isinstance(v, dict):
+            for k2, v2 in v.items():
+                if "session" in k2.lower() or "sid" in k2.lower():
+                    if isinstance(v2, str) and len(v2) >= 4:
+                        sid = v2
+                        print(f">>> sessionId nested JSON[{k!r}][{k2!r}]: {sid!r}")
+                        break
+except Exception as exc:
+    print(f">>> JSON parse error: {exc}")
 
-print(f"\n>>> Extracted sessionId: {sid!r}")
+# Check Set-Cookie header
+if not sid:
+    for hdr in ("Set-Cookie", "set-cookie"):
+        v = hdrs.get(hdr, "")
+        m = re.search(r"sessionId=([A-Za-z0-9_\-]{4,})", v)
+        if m:
+            sid = m.group(1)
+            print(f">>> sessionId from Set-Cookie: {sid!r}")
+            break
+
+# Raw body scan
+if not sid:
+    m = re.search(r'sessionId["\s:=]+([A-Za-z0-9_\-]{8,})', body)
+    if m:
+        sid = m.group(1)
+        print(f">>> sessionId from raw body scan: {sid!r}")
+
+# Fall back to guest_sid if login didn't issue a new one
+if not sid and guest_sid:
+    sid = guest_sid
+    print(f">>> No new sessionId from login — reusing guest_sid: {sid!r}")
+
+print(f"\n>>> Final sessionId: {sid!r}")
 
 if not sid:
     print("\n[!] Could not extract sessionId — cannot continue.")
