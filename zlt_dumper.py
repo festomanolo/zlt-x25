@@ -303,13 +303,23 @@ def web_login(
 
     Returns: (success, session_id, endpoint_that_worked, error_message)
 
-    session_id="" with success=True  →  IP-based auth (M30 Airtel build).
-    Handles:
-      1. goform LOGIN + sessionId cookie       (M30/M60 newer)
-      2. goform LOGIN + IP-based auth          (M30 Airtel — no cookie)
-      3. http.cgi JSON login                   (X25/X25A yocto_orca)
+    The X25 firmware requires a sessionId in EVERY request body —
+    even the login request itself. The sessionId is generated client-side
+    (like the browser JS does) and the server stores it after login succeeds.
     """
+    import hashlib, os as _os
+
+    def _gen_sid() -> str:
+        """Generate a random 64-char hex sessionId, same as the browser JS does."""
+        raw = f"{time.time()}{_os.urandom(32).hex()}"
+        return hashlib.sha256(raw.encode()).hexdigest()
+
     ctx = ssl._create_unverified_context() if proto == "https" else None
+
+    # Generate our own sessionId — the router will bind it to our session
+    # after a successful login (it never issues one; client creates it)
+    generated_sid = _gen_sid()
+    logger.info("Generated client-side sessionId: %s…", generated_sid[:16])
 
     base_headers = {
         "X-Requested-With": "XMLHttpRequest",
@@ -403,12 +413,16 @@ def web_login(
             return False, "", "", str(exc)
 
     # ── Attempt 2: http.cgi JSON (X25 / X25A yocto_orca) ────────────────────
+    # X25 requires sessionId in the body of every request, including login.
+    # We use our generated_sid — the server binds it after successful auth.
     cgi_url = f"{proto}://{router_ip}/cgi-bin/http.cgi"
     for payload in [
         {"cmd": 1,   "method": "POST", "subcmd": 1, "language": "EN",
-         "username": username, "password": password},
+         "username": username, "password": password,
+         "sessionId": generated_sid},
         {"cmd": 100, "method": "POST", "subcmd": 0, "language": "EN",
-         "user": username, "pass": password},
+         "user": username, "pass": password,
+         "sessionId": generated_sid},
     ]:
         data = json.dumps(payload).encode("utf-8")
         hdrs = {**base_headers, "Content-Type": "application/json"}
@@ -419,12 +433,11 @@ def web_login(
                 body = resp.read().decode("utf-8", errors="ignore")
                 logger.debug("http.cgi LOGIN response HTTP %d: %s", resp.status, body[:300])
                 sid = _extract_sid(resp.headers, body)
-                if sid:
-                    logger.info("http.cgi LOGIN OK with sessionId")
-                    return True, sid, cgi_url, ""
+                if not sid:
+                    sid = generated_sid  # use our generated one
                 if _login_succeeded(body):
-                    logger.info("http.cgi LOGIN OK — no explicit sessionId")
-                    return True, "", cgi_url, ""
+                    logger.info("http.cgi LOGIN OK — using sessionId: %s…", sid[:16])
+                    return True, sid, cgi_url, ""
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="ignore")
             logger.debug("http.cgi LOGIN HTTP %d: %s", e.code, body[:200])

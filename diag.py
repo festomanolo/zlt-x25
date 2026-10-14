@@ -22,6 +22,17 @@ USERNAME   = "admin"
 PASSWORD   = "Wachina@2025"
 PROTO      = "http"
 
+import hashlib, os, time
+
+def gen_session_id() -> str:
+    """
+    Mirrors what the X25 web UI JavaScript does:
+    generates a random 64-char hex string client-side
+    and sends it with every request from the very first one.
+    """
+    raw = f"{time.time()}{os.urandom(32).hex()}"
+    return hashlib.sha256(raw.encode()).hexdigest()
+
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def post_json(url, payload, session_id=""):
@@ -53,100 +64,21 @@ def post_json(url, payload, session_id=""):
         print(f"    EXCEPTION: {exc}")
         return 0, {}, str(exc)
 
-# ── Step 0: load the index page to get a guest sessionId ─────────────────────
+# ── Step 0: generate client-side sessionId (same as browser JS does) ─────────
 
 print("=" * 60)
-print("STEP 0 — FETCH GUEST SESSION FROM INDEX PAGE")
+print("STEP 0 — GENERATE CLIENT-SIDE SESSION ID")
 print("=" * 60)
 
 url = f"{PROTO}://{ROUTER_IP}/cgi-bin/http.cgi"
-index_url = f"{PROTO}://{ROUTER_IP}/index.html"
 
-guest_sid = ""
-print(f"\n>>> GET {index_url}")
-try:
-    req0 = urllib.request.Request(
-        index_url,
-        headers={"User-Agent": "Mozilla/5.0",
-                 "Accept": "text/html,application/xhtml+xml,*/*"},
-    )
-    with urllib.request.urlopen(req0, timeout=8) as r0:
-        body0 = r0.read().decode("utf-8", errors="ignore")
-        raw_hdrs0 = dict(r0.headers)
-        print(f"    status  : {r0.status}")
-        print(f"    headers : {raw_hdrs0}")
-
-        # Check Set-Cookie for guest session
-        for hdr in ("Set-Cookie", "set-cookie"):
-            v = raw_hdrs0.get(hdr, "")
-            m = re.search(r"sessionId=([A-Za-z0-9_\-]{4,})", v)
-            if m:
-                guest_sid = m.group(1)
-                break
-
-        # Also scan page body for sessionId JS variable
-        if not guest_sid:
-            m = re.search(r'["\']?sessionId["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-]{8,})["\']',
-                          body0)
-            if m:
-                guest_sid = m.group(1)
-
-        print(f"    guest_sid from index: {guest_sid!r}")
-        print(f"    body snippet: {body0[:300]}")
-
-except Exception as exc:
-    print(f"    EXCEPTION: {exc}")
-
-# Also try a GET to http.cgi with no payload — some firmware issues a session
-print(f"\n>>> GET {url} (bare, no payload)")
-try:
-    req_bare = urllib.request.Request(
-        url,
-        headers={"User-Agent": "Mozilla/5.0",
-                 "Referer": index_url},
-    )
-    with urllib.request.urlopen(req_bare, timeout=8) as rb:
-        body_bare = rb.read().decode("utf-8", errors="ignore")
-        raw_hdrs_bare = dict(rb.headers)
-        print(f"    status  : {rb.status}")
-        print(f"    headers : {raw_hdrs_bare}")
-        print(f"    body    : {body_bare[:300]}")
-        for hdr in ("Set-Cookie", "set-cookie"):
-            v = raw_hdrs_bare.get(hdr, "")
-            m = re.search(r"sessionId=([A-Za-z0-9_\-]{4,})", v)
-            if m:
-                guest_sid = m.group(1)
-                print(f"    guest_sid from bare GET: {guest_sid!r}")
-                break
-except Exception as exc:
-    print(f"    EXCEPTION: {exc}")
-
-# Try cmd:0 GET — firmware often issues a session on first probe
-print(f"\n>>> POST {url} cmd:0 GET (session probe)")
-s_probe, h_probe, b_probe = post_json(url, {
-    "cmd": 0, "method": "GET", "language": "EN",
-})
-print(f"    probe body: {b_probe[:300]}")
-if not guest_sid:
-    for hdr in ("Set-Cookie", "set-cookie"):
-        v = h_probe.get(hdr, "")
-        m = re.search(r"sessionId=([A-Za-z0-9_\-]{4,})", v)
-        if m:
-            guest_sid = m.group(1)
-            print(f"    guest_sid from probe: {guest_sid!r}")
-            break
-    if not guest_sid:
-        try:
-            jp = json.loads(b_probe)
-            for k in ("sessionId", "sid", "token"):
-                if isinstance(jp.get(k), str) and len(jp[k]) >= 4:
-                    guest_sid = jp[k]
-                    print(f"    guest_sid from probe JSON[{k!r}]: {guest_sid!r}")
-                    break
-        except Exception:
-            pass
-
-print(f"\n>>> Using guest_sid: {guest_sid!r}")
+# The X25 web UI generates a random 64-char hex sessionId in JavaScript
+# and includes it in EVERY request body from the very first one —
+# including the login request itself. The server never issues it;
+# the client generates it and the server stores it after login.
+guest_sid = gen_session_id()
+print(f"\n>>> Generated sessionId: {guest_sid}")
+print("    (This mirrors what the browser JS generates on page load)\n")
 
 # ── Step 1: login ─────────────────────────────────────────────────────────────
 
@@ -208,9 +140,9 @@ if not sid:
 # Fall back to guest_sid if login didn't issue a new one
 if not sid and guest_sid:
     sid = guest_sid
-    print(f">>> No new sessionId from login — reusing guest_sid: {sid!r}")
+    print(f">>> No new sessionId in response — using our generated sid: {sid[:16]}…")
 
-print(f"\n>>> Final sessionId: {sid!r}")
+print(f"\n>>> Final sessionId: {sid[:16]}…")
 
 if not sid:
     print("\n[!] Could not extract sessionId — cannot continue.")
